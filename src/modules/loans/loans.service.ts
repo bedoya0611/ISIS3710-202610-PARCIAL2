@@ -6,16 +6,19 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
-import { DataSource, FindOptionsWhere, In, LessThan, Repository } from 'typeorm';
+import { DataSource, FindOptionsWhere, In, IsNull, LessThan, Repository } from 'typeorm';
 import { Item } from '../items/entities/item.entity';
 import { User } from '../users/entities/user.entity';
-import { OPEN_LOAN_STATUSES, RETURNABLE_LOAN_STATUSES } from './constants/loan-statuses';
+import {
+  OPEN_LOAN_STATUSES,
+  RETURNABLE_LOAN_STATUSES,
+  TERMINAL_LOAN_STATUSES,
+} from './constants/loan-statuses';
 import { CreateLoanDto } from './dto/create-loan.dto';
 import { ListLoansQueryDto } from './dto/list-loans-query.dto';
 import { LoanResponseDto } from './dto/loan-response.dto';
 import { Loan, LoanStatus } from './entities/loan.entity';
-
-const MS_PER_DAY = 24 * 60 * 60 * 1000;
+import { calculateLoanFineAmount, MS_PER_DAY } from './utils/loan-fine.util';
 
 @Injectable()
 export class LoansService {
@@ -68,7 +71,9 @@ export class LoansService {
       });
 
       if (openLoanForItem) {
-        throw new ConflictException('Item is not available');
+        throw new ConflictException(
+          `Item is not available; blocked by loanId ${openLoanForItem.id}`,
+        );
       }
 
       const activeLoansForUser = await loansRepository.count({
@@ -148,6 +153,10 @@ export class LoansService {
         throw new NotFoundException('Loan not found');
       }
 
+      if (TERMINAL_LOAN_STATUSES.includes(loan.status)) {
+        throw new BadRequestException('Loan is terminal and cannot be returned');
+      }
+
       if (!RETURNABLE_LOAN_STATUSES.includes(loan.status)) {
         throw new ConflictException('Loan cannot be returned from its current status');
       }
@@ -155,7 +164,7 @@ export class LoansService {
       const returnedAt = new Date();
       loan.returnedAt = returnedAt;
       loan.status = LoanStatus.RETURNED;
-      loan.fineAmount = this.calculateFine(loan.dueAt, returnedAt);
+      loan.fineAmount = calculateLoanFineAmount(loan.dueAt, returnedAt, this.getDailyFineRate());
 
       const savedLoan = await loansRepository.save(loan);
       return this.toLoanResponse(savedLoan);
@@ -176,8 +185,8 @@ export class LoansService {
         throw new NotFoundException('Loan not found');
       }
 
-      if (loan.status === LoanStatus.RETURNED || loan.status === LoanStatus.LOST) {
-        throw new ConflictException('Loan cannot be marked as lost from its current status');
+      if (TERMINAL_LOAN_STATUSES.includes(loan.status)) {
+        throw new BadRequestException('Loan is terminal and cannot be marked as lost');
       }
 
       loan.status = LoanStatus.LOST;
@@ -189,7 +198,7 @@ export class LoansService {
 
   private async refreshOverdueLoans(): Promise<void> {
     await this.loansRepository.update(
-      { status: LoanStatus.ACTIVE, dueAt: LessThan(new Date()) },
+      { status: LoanStatus.ACTIVE, dueAt: LessThan(new Date()), returnedAt: IsNull() },
       { status: LoanStatus.OVERDUE },
     );
   }
@@ -198,19 +207,8 @@ export class LoansService {
     const maxDueAt = new Date(loanedAt.getTime() + this.getMaxLoanDays() * MS_PER_DAY);
 
     if (dueAt > maxDueAt) {
-      throw new ConflictException(`Loan duration cannot exceed ${this.getMaxLoanDays()} days`);
+      throw new BadRequestException(`Loan duration cannot exceed ${this.getMaxLoanDays()} days`);
     }
-  }
-
-  private calculateFine(dueAt: Date, returnedAt: Date): string {
-    const overdueMs = returnedAt.getTime() - dueAt.getTime();
-
-    if (overdueMs <= 0) {
-      return '0.00';
-    }
-
-    const overdueDays = Math.ceil(overdueMs / MS_PER_DAY);
-    return (overdueDays * this.getDailyFineRate()).toFixed(2);
   }
 
   private getMaxActiveLoans(): number {
